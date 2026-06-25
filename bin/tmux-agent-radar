@@ -1,0 +1,371 @@
+#!/usr/bin/env bash
+set -uo pipefail
+
+SCRIPT="$0"
+AGENTS_DEFAULT="pi opencode claude codex gemini aider cursor-agent goose amp qwen"
+AGENTS="${TMUX_AGENT_RADAR_AGENTS:-$(tmux show -gqv @agent-radar-agents 2>/dev/null || true)}"
+AGENTS="${AGENTS:-$AGENTS_DEFAULT}"
+GENERIC_WINDOWS="fish zsh bash sh tmux vim nvim vi node python python3"
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/tmux-agent-radar"
+CACHE="$STATE_DIR/rows.tsv"
+
+has() { command -v "$1" >/dev/null 2>&1; }
+trim() { awk '{$1=$1;print}'; }
+
+pane_opt() { tmux show-option -p -v -t "$1" "$2" 2>/dev/null || true; }
+set_pane_opt() { tmux set-option -p -t "$1" "$2" "$3" >/dev/null; }
+
+capture() {
+  local pane="$1"
+  tmux capture-pane -p -J -S -120 -t "$pane" 2>/dev/null || \
+    tmux capture-pane -a -p -J -S -120 -t "$pane" 2>/dev/null || true
+}
+
+capture_visible() {
+  local pane="$1"
+  tmux capture-pane -p -J -S 0 -t "$pane" 2>/dev/null || true
+}
+
+descendants() {
+  local pid="$1" kids kid
+  kids="$(pgrep -P "$pid" 2>/dev/null || true)"
+  for kid in $kids; do
+    printf '%s\n' "$kid"
+    descendants "$kid"
+  done
+}
+
+cmd_name() {
+  local pid="$1" c
+  c="$(ps -p "$pid" -o comm= 2>/dev/null | head -1 | xargs basename 2>/dev/null || true)"
+  printf '%s' "$c"
+}
+
+cmd_args() { ps -p "$1" -o args= 2>/dev/null | head -1 || true; }
+
+agent_from_pane() {
+  local current="$1" pid="$2" a p c args
+  for a in $AGENTS; do [ "$current" = "$a" ] && { printf '%s' "$a"; return; }; done
+  for p in "$pid" $(descendants "$pid"); do
+    c="$(cmd_name "$p")"; args=" $(cmd_args "$p") "
+    for a in $AGENTS; do
+      if [ "$c" = "$a" ] || [[ "$args" == *"/$a "* ]] || [[ "$args" == *" $a "* ]]; then
+        printf '%s' "$a"; return
+      fi
+    done
+  done
+}
+
+is_generic_window() {
+  local w="$1" a g
+  for g in $GENERIC_WINDOWS; do [ "$w" = "$g" ] && return 0; done
+  for a in $AGENTS; do [ "$w" = "$a" ] && return 0; done
+  return 1
+}
+
+repo_name() { basename "$1"; }
+
+infer_label() {
+  local pane="$1" window="$2" cwd="$3" label
+  label="$(pane_opt "$pane" @agent-radar-label)"
+  [ -n "$label" ] && { printf '%s' "$label"; return; }
+  if ! is_generic_window "$window"; then printf '%s' "$window"; return; fi
+  printf 'unlabeled · %s' "$(repo_name "$cwd")"
+}
+
+detect_prompt() {
+  local pane="$1" lower
+  lower="$(capture_visible "$pane" | tr '[:upper:]' '[:lower:]')"
+  printf '%s' "$lower" | grep -Eq '(allow|approve|deny).*(command|tool|edit|write|run|permission)|permission.*(required|prompt|needed)|do you want to (continue|proceed)|run this command|\[(y/n|y/n)\]|yes/no'
+}
+
+status_from_text() {
+  local pane="$1" last="$2" now age cached icon
+  cached="$(pane_opt "$pane" @agent-radar-status)"
+  icon="$(pane_opt "$pane" @agent-radar-icon)"
+  if [ -n "$cached" ]; then printf '%s\t%s' "${icon:-?}" "$cached"; return; fi
+  now="$(date +%s)"; age=$(( now - last ))
+  if [ "$age" -lt 12 ]; then printf '▶\tRUNNING'; return; fi
+  if [ "$age" -lt 300 ]; then printf '○\tIDLE'; return; fi
+  printf '◌\tSTALE'
+}
+
+age_human() {
+  local last="$1" now d
+  now="$(date +%s)"; d=$(( now - last ))
+  if [ "$d" -lt 60 ]; then printf '%ss' "$d"
+  elif [ "$d" -lt 3600 ]; then printf '%sm' $((d/60))
+  else printf '%sh' $((d/3600)); fi
+}
+
+scan() {
+  local filter="${1:-all}" dir panes psfile mapfile pane session win_idx win_name cmd cwd pid last agent stat icon label loc age order kind
+  dir="$(mktemp -d "${TMPDIR:-/tmp}/agent-radar.XXXXXX")" || exit 1
+  panes="$dir/panes"; psfile="$dir/ps"; mapfile="$dir/map"
+  tmux list-panes -a -F '#{pane_id}	#{session_name}	#{window_index}	#{window_name}	#{pane_current_command}	#{pane_current_path}	#{pane_pid}	#{window_activity}' >"$panes"
+  ps -axo pid=,ppid=,comm= >"$psfile"
+  awk -v agents="$AGENTS" '
+    BEGIN { split(agents,a," "); for (i in a) isagent[a[i]]=1 }
+    ARGIND==1 { root[$7]=$5; next }
+    { pid=$1; ppid=$2; cmd=$3; sub(/^.*\//,"",cmd); parent[pid]=ppid; proc[pid]=cmd }
+    END {
+      for (r in root) if (root[r] in isagent) found[r]=root[r]
+      for (p in proc) if (proc[p] in isagent) {
+        x=p; seen=0
+        while (x && seen++ < 50) { if (x in root) { if (!(x in found)) found[x]=proc[p]; break }; x=parent[x] }
+      }
+      for (r in found) print r "\t" found[r]
+    }' "$panes" "$psfile" >"$mapfile"
+  while IFS=$'\t' read -r pane session win_idx win_name cmd cwd pid last; do
+    last="${last:-$(date +%s)}"
+    agent="$(awk -F '\t' -v p="$pid" '$1==p {print $2; exit}' "$mapfile")"
+    loc="${session}:${win_idx}:${win_name}"
+    age="$(age_human "$last")"
+    if [ -n "$agent" ]; then
+      kind="agent"
+      if detect_prompt "$pane"; then icon="⚠"; stat="WAITING_PERMISSION"
+      else IFS=$'\t' read -r icon stat <<<"$(status_from_text "$pane" "$last")"; fi
+      label="$(infer_label "$pane" "$win_name" "$cwd")"
+      case "$stat" in WAITING_PERMISSION) order=0;; RUNNING) order=1;; IDLE) order=2;; *) order=3;; esac
+    else
+      kind="pane"; agent="$cmd"; icon="·"; stat="PANE"; order=4
+      label="$(pane_opt "$pane" @agent-radar-label)"
+      [ -z "$label" ] && label="$win_name · $(repo_name "$cwd")"
+    fi
+    [ "$filter" = "prompts" ] && [ "$stat" != "WAITING_PERMISSION" ] && continue
+    [ "$filter" = "agents" ] && [ "$kind" != "agent" ] && continue
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$order" "$pane" "$icon" "$agent" "$loc" "$stat" "$age" "$label" "$cwd" "$kind"
+  done <"$panes" | sort -t $'\t' -k1,1n -k5,5
+  rm -rf "$dir"
+}
+
+rows() {
+  local filter="${1:-all}"
+  if [ -r "$CACHE" ]; then
+    case "$filter" in
+      prompts) awk -F '\t' '$6=="WAITING_PERMISSION"' "$CACHE" ;;
+      agents) awk -F '\t' '$10=="agent"' "$CACHE" ;;
+      *) cat "$CACHE" ;;
+    esac
+  else
+    scan "$filter"
+  fi
+}
+
+view() {
+  rows "${1:-all}" | awk -F '\t' '
+    BEGIN {
+      printf "PANE\t%-2s  %-9s  %-34s  %-18s  %-5s  %s\n", "", "CMD", "LOCATION", "STATE", "AGE", "LABEL"
+    }
+    {
+      label=$8; if (length(label) > 68) label=substr(label,1,65) "..."
+      loc=$5;   if (length(loc) > 34) loc=substr(loc,1,31) "..."
+      cmd=$4;   if (length(cmd) > 9) cmd=substr(cmd,1,8) "…"
+      printf "%s\t%-2s  %-9s  %-34s  %-18s  %-5s  %s\n", $2, $3, cmd, loc, $6, $7, label
+    }'
+}
+
+tree() {
+  local filter="${1:-all}"
+  rows "$filter" | sort -t $'\t' -k5,5 -k1,1n | awk -F '\t' '
+    function short(s,n){ return length(s)>n ? substr(s,1,n-1) "…" : s }
+    function stat(s){
+      if (s=="WAITING_PERMISSION") return "PERMISSION"
+      if (s=="RUNNING") return "RUN"
+      if (s=="STALE") return "OLD"
+      if (s=="IDLE") return "IDLE"
+      if (s=="PANE") return ""
+      return s
+    }
+    function session_header(sess) {
+      warn = sess_warn_count[sess] ? "  \033[1;33m⚠ needs you " sess_warn_count[sess] "\033[0m" : ""
+      meta = sprintf("%sp", sess_count[sess])
+      if (sess_agents_count[sess]) meta = meta " " sess_agents_count[sess] "a"
+      text = sprintf("\033[1;36m◆ %s\033[0m  \033[2m%s%s\033[0m", sess, meta, warn)
+      printf "%s\t-\n", text
+    }
+    function window_header(key) {
+      meta = pane_count[key] "p"
+      if (win_agent_count[key]) meta = meta " " win_agent_count[key] "a"
+      warn = win_warn_count[key] ? " \033[1;33m⚠ needs you\033[0m" : ""
+      text = sprintf("  \033[2m┝\033[0m \033[1m%s\033[0m  \033[2m%s\033[0m%s", winlabels[key], meta, warn)
+      printf "%s\t-\n", text
+    }
+    function pane_line() {
+      label=short(f[8],32); cmd=short(f[4],8); s=stat(f[6])
+      if (f[6]=="WAITING_PERMISSION")
+        text = sprintf("  \033[2m│\033[0m \033[1;33m⚠ %-8s PERMISSION  %s\033[0m  %s", cmd, f[7], label)
+      else if (f[6]=="RUNNING")
+        text = sprintf("  \033[2m│\033[0m \033[32m▶\033[0m %-8s \033[2mRUN  %-4s\033[0m %s", cmd, f[7], label)
+      else if (f[10]=="agent")
+        text = sprintf("  \033[2m│\033[0m \033[2m%s\033[0m %-8s \033[2m%-4s %-4s\033[0m %s", f[3], cmd, s, f[7], label)
+      else
+        text = sprintf("  \033[2m│\033[0m \033[2m·\033[0m %-8s \033[2m     %-4s\033[0m %s", cmd, f[7], label)
+      printf "%s\t%s\n", text, f[2]
+    }
+    {
+      split($5,a,":"); sess=a[1]; idx=a[2]; win=substr($5,length(sess)+length(idx)+3)
+      key=sess SUBSEP idx SUBSEP win
+      rows[++n]=$0; sessions[n]=sess; wins[n]=key; winlabels[key]=idx ":" win
+      pane_count[key]++; sess_count[sess]++
+      if ($10=="agent") { sess_agents_count[sess]++; win_agent_count[key]++ }
+      if ($6=="WAITING_PERMISSION") { sess_warn_count[sess]++; win_warn_count[key]++ }
+    }
+    END {
+      for (i=1;i<=n;i++) {
+        split(rows[i],f,"\t"); sess=sessions[i]; key=wins[i]
+        if (sess != last_session) { session_header(sess); last_session=sess; last_window="" }
+        if (key != last_window) { window_header(key); last_window=key }
+        pane_line()
+      }
+    }'
+}
+
+preview() {
+  local pane="$1" icon="${2:-}" agent="${3:-}" loc="${4:-}" status="${5:-}" label="${6:-}" cwd="${7:-}"
+  [[ "$pane" == %* ]] || { printf '\033[2mSelect a pane row to preview or jump.\033[0m\n'; return 0; }
+  if [ -z "$agent" ] && [ -r "$CACHE" ]; then
+    local row; row="$(awk -F '\t' -v p="$pane" '$2==p {print; exit}' "$CACHE")"
+    local kind
+    IFS=$'\t' read -r _ pane icon agent loc status _ label cwd kind <<<"$row"
+  fi
+  if [ "$status" = "WAITING_PERMISSION" ]; then
+    printf '\033[1;33m⚠ PERMISSION NEEDED\033[0m  \033[2m%s · %s\033[0m\n' "$agent" "$loc"
+  else
+    printf '\033[1;36m%s %s\033[0m  \033[2m%s\033[0m\n' "$icon" "$agent" "$loc"
+  fi
+  printf '\033[1m%s\033[0m\n' "${label:-unlabeled}"
+  printf '\033[2m%s · %s\033[0m\n\n' "$status" "$cwd"
+  capture "$pane" | tail -45
+}
+
+popup_marker() {
+  mkdir -p "$STATE_DIR"
+  printf '%s/popup.%s' "$STATE_DIR" "$(printf '%s' "$1" | tr -c 'A-Za-z0-9_.-' '_')"
+}
+
+toggle() {
+  local client="${1:-}" width="${2:-92%}" height="${3:-88%}" marker
+  local target=()
+  [ -n "$client" ] && target=(-c "$client")
+  marker="$(popup_marker "${client:-default}")"
+  if [ -e "$marker" ]; then
+    rm -f "$marker"
+    tmux display-popup "${target[@]}" -C 2>/dev/null || true
+    return
+  fi
+  : >"$marker"
+  tmux display-popup "${target[@]}" -E -w "$width" -h "$height" -T ' Agent Radar ' \
+    "trap 'rm -f '\''$marker'\''' EXIT INT TERM; '$SCRIPT' ui || true"
+}
+
+ui() {
+  has fzf || { echo "tmux-agent-radar needs fzf for the popup UI" >&2; exit 1; }
+  local reload_all reload_agents reload_prompts
+  reload_all="$SCRIPT tree"
+  reload_agents="$SCRIPT tree agents"
+  reload_prompts="$SCRIPT tree prompts"
+  tree | fzf --ansi --no-multi --height=100% --layout=reverse --border=none \
+    --margin=0 --padding='1,2' --info=inline-right --highlight-line \
+    --prompt='tmux › ' --pointer='▌' --marker='✓ ' --scrollbar='▌' \
+    --color='bg:-1,bg+:-1,gutter:-1,border:#4f4946,label:#89b482,prompt:#7daea3,pointer:#ea6962,marker:#a9b665,header:#928374,info:#928374,hl:#d8a657,hl+:#d8a657,fg:#d4be98,fg+:#f2e5bc' \
+    --delimiter=$'\t' --with-nth='1' \
+    --preview="$SCRIPT preview {2}" --preview-window='right,50%,border-rounded,wrap' --preview-label=' preview ' --preview-label-pos=2 \
+    --header='↵ jump  ^F/esc close  ^L label  ^W window  ^P prompts  ^G agents  ^A all' \
+    --bind="ctrl-f:abort" \
+    --bind="enter:become($SCRIPT jump {2})" \
+    --bind="ctrl-l:become($SCRIPT label {2})" \
+    --bind="ctrl-w:become($SCRIPT rename-window {2})" \
+    --bind="ctrl-p:reload($reload_prompts)" \
+    --bind="ctrl-g:reload($reload_agents)" \
+    --bind="ctrl-a:reload($reload_all)" \
+    --bind="ctrl-k:execute-silent($SCRIPT kill {2})+reload($reload_all)"
+}
+
+jump() {
+  local pane="$1"
+  [[ "$pane" == %* ]] || return 0
+  tmux switch-client -t "=$(tmux display-message -p -t "$pane" '#{session_name}')" 2>/dev/null || true
+  tmux select-window -t "$(tmux display-message -p -t "$pane" '#{session_name}:#{window_index}')"
+  tmux select-pane -t "$pane"
+}
+
+label() {
+  local pane="$1" current
+  [[ "$pane" == %* ]] || return 0
+  current="$(pane_opt "$pane" @agent-radar-label)"
+  tmux command-prompt -I "$current" -p 'Agent label' "set-option -p -t $pane @agent-radar-label '%%' \; select-pane -T '🤖 %%'"
+}
+
+rename_window() {
+  local pane="$1" current target
+  [[ "$pane" == %* ]] || return 0
+  current="$(infer_label "$pane" "$(tmux display-message -p -t "$pane" '#{window_name}')" "$(tmux display-message -p -t "$pane" '#{pane_current_path}')")"
+  target="$(tmux display-message -p -t "$pane" '#{session_name}:#{window_index}')"
+  tmux command-prompt -I "$current" -p 'Window name' "rename-window -t '$target' '%%'"
+}
+
+kill_target() {
+  local pane="$1"
+  [[ "$pane" == %* ]] || return 0
+  tmux confirm-before -p "Kill pane $pane?" "kill-pane -t $pane"
+}
+
+watch() {
+  mkdir -p "$STATE_DIR"
+  local pidfile="$STATE_DIR/watch.pid" seen="$STATE_DIR/notified" interval tmp pane icon agent loc stat age label cwd key msg
+  interval="$(tmux show -gqv @agent-radar-watch-interval 2>/dev/null || true)"; interval="${interval:-5}"
+  if [ -s "$pidfile" ] && kill -0 "$(cat "$pidfile")" 2>/dev/null; then exit 0; fi
+  echo $$ >"$pidfile"; trap 'rm -f "$pidfile"' EXIT
+  touch "$seen"
+  while tmux list-sessions >/dev/null 2>&1; do
+    tmp="$CACHE.$$"
+    scan >"$tmp" && mv "$tmp" "$CACHE"
+    if [ "$(tmux show -gqv @agent-radar-notify 2>/dev/null || true)" = "on" ] || [ "$(tmux show -gqv @agent-radar-notify-macos 2>/dev/null || true)" = "on" ]; then
+      rows prompts | while IFS=$'\t' read -r _ pane icon agent loc stat age label cwd kind; do
+        key="$pane:$(capture_visible "$pane" | cksum | awk '{print $1}')"
+        grep -qxF "$key" "$seen" && continue
+        echo "$key" >>"$seen"
+        msg="⚠ $agent needs permission · $loc · $label"
+        [ "$(tmux show -gqv @agent-radar-notify 2>/dev/null || true)" = "on" ] && tmux display-message "$msg" 2>/dev/null || true
+        if [ "$(tmux show -gqv @agent-radar-notify-macos 2>/dev/null || true)" = "on" ]; then
+          osascript -e "display notification \"$loc — $label\" with title \"Agent needs permission\"" >/dev/null 2>&1 || true
+        fi
+      done
+    fi
+    sleep "$interval"
+  done
+}
+
+status() {
+  local data total prompts running idle
+  [ -r "$CACHE" ] || exit 0
+  data="$(cat "$CACHE")"
+  total="$(printf '%s\n' "$data" | awk -F '\t' '$10=="agent"{c++} END{print c+0}')"
+  [ "$total" = 0 ] && exit 0
+  prompts="$(printf '%s\n' "$data" | awk -F '\t' '$6=="WAITING_PERMISSION"{c++} END{print c+0}')"
+  running="$(printf '%s\n' "$data" | awk -F '\t' '$6=="RUNNING"{c++} END{print c+0}')"
+  idle="$(printf '%s\n' "$data" | awk -F '\t' '$6=="IDLE"{c++} END{print c+0}')"
+  printf '🤖%s' "$total"
+  [ "$prompts" -gt 0 ] && printf ' ⚠%s' "$prompts"
+  [ "$running" -gt 0 ] && printf ' ▶%s' "$running"
+  [ "$idle" -gt 0 ] && printf ' ○%s' "$idle"
+  return 0
+}
+
+case "${1:-ui}" in
+  ui) ui ;;
+  toggle) toggle "${2:-}" "${3:-92%}" "${4:-88%}" ;;
+  rows|list) rows "${2:-all}" ;;
+  view) view "${2:-all}" ;;
+  tree) tree "${2:-all}" ;;
+  scan) scan "${2:-all}" ;;
+  preview) preview "$2" ;;
+  jump) jump "$2" ;;
+  label) label "$2" ;;
+  rename-window) rename_window "$2" ;;
+  kill) kill_target "$2" ;;
+  status) status ;;
+  watch) watch ;;
+  *) echo "usage: tmux-agent-radar [ui|toggle CLIENT WIDTH HEIGHT|rows|view|tree|scan|preview PANE|jump PANE|label PANE|rename-window PANE|status|watch]" >&2; exit 2 ;;
+esac
