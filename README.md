@@ -1,20 +1,41 @@
 # tmux-agent-radar
 
-A tmux popup dashboard for watching multiple CLI coding agents.
+A tmux/fzf popup for finding CLI coding-agent panes.
 
-It finds panes running agents like `pi`, `opencode`, `claude`, `codex`, `gemini`, and `cursor-agent`, highlights panes that need permission, previews recent output, and jumps straight to the selected pane.
+It scans tmux panes for agents like `pi`, `opencode`, `claude`, `codex`, `gemini`, and `cursor-agent`, flags visible permission prompts, previews captured pane output, and jumps to the selected pane.
+
+This is intentionally a passive radar. It does **not** approve, reject, or type into agent prompts from the popup; jump to the pane and answer there.
 
 ![tmux-agent-radar demo](assets/demo.gif)
 
 ## Features
 
-- Toggleable tmux popup: `prefix + C-f`
+- Toggleable tmux/fzf popup: `prefix + C-f`
 - Agent detection from pane commands and process trees
 - Permission-prompt detection from visible pane text
-- Recent-output preview before jumping
-- Agents-only / all-panes toggle
+- Raw recent-output preview before jumping
+- Agents-only / all-panes toggle with `Ctrl-A`
+- Jump to the selected pane with `Enter`
 - Optional status-bar badge: `🤖4 ⚠1 ▶2`
 - Optional tmux or macOS notifications for permission prompts
+
+## Popup controls
+
+- `Enter`: jump to the selected pane
+- `Ctrl-A`: toggle agents-only / all-panes
+- `Ctrl-F` or `Esc`: close the popup
+
+Not supported from the popup: approving, denying, rejecting, editing labels, renaming windows, or killing panes.
+
+## Demo recording
+
+The demo GIF is recorded from a disposable nested tmux session using the real plugin UI, not hand-drawn. To regenerate it:
+
+```sh
+scripts/record-demo.sh
+```
+
+`record-demo.sh` prefers [VHS](https://github.com/charmbracelet/vhs), and can fall back to `asciinema` + `agg`.
 
 ## Requirements
 

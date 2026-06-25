@@ -286,6 +286,9 @@ toggle() {
 
 ui() {
   has fzf || { echo "tmux-agent-radar needs fzf for the popup UI" >&2; exit 1; }
+  mkdir -p "$STATE_DIR"
+  local tmp="$CACHE.$$"
+  scan >"$tmp" && mv "$tmp" "$CACHE"
   local mode="${1:-all}" next prompt header
   if [ "$mode" = "agents" ]; then
     next="all"; prompt="agents › "; header="↵ jump  ^A show all  ^F/esc close"
