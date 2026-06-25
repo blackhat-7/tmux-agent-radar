@@ -288,9 +288,9 @@ ui() {
   has fzf || { echo "tmux-agent-radar needs fzf for the popup UI" >&2; exit 1; }
   local mode="${1:-all}" next prompt header
   if [ "$mode" = "agents" ]; then
-    next="all"; prompt="agents › "; header="↵ jump  tab show all  ^F/esc close"
+    next="all"; prompt="agents › "; header="↵ jump  ^T show all  ^F/esc close"
   else
-    mode="all"; next="agents"; prompt="all › "; header="↵ jump  tab agents only  ^F/esc close"
+    mode="all"; next="agents"; prompt="all › "; header="↵ jump  ^T agents only  ^F/esc close"
   fi
   tree "$mode" | fzf --ansi --no-multi --height=100% --layout=reverse --border=none \
     --margin=0 --padding='1,2' --info=inline-right --highlight-line \
@@ -301,7 +301,7 @@ ui() {
     --header="$header" \
     --bind="ctrl-f:abort" \
     --bind="enter:become($SCRIPT jump {2})" \
-    --bind="tab:become($SCRIPT ui $next)"
+    --bind="ctrl-t:become($SCRIPT ui $next)"
 }
 
 jump() {
