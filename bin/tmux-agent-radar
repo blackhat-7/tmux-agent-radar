@@ -65,12 +65,24 @@ is_generic_window() {
 
 repo_name() { basename "$1"; }
 
+clean_title() {
+  local title="$1" repo="$2"
+  title="${title#π - }"; title="${title#🤖 }"
+  title="${title% - $repo}"
+  printf '%s' "$title" | cut -c1-34
+}
+
 infer_label() {
-  local pane="$1" window="$2" cwd="$3" label
+  local pane="$1" window="$2" cwd="$3" title="${4:-}" label repo
+  repo="$(repo_name "$cwd")"
   label="$(pane_opt "$pane" @agent-radar-label)"
   [ -n "$label" ] && { printf '%s' "$label"; return; }
+  if [ -n "$title" ] && [ "$title" != "$window" ]; then
+    label="$(clean_title "$title" "$repo")"
+    [ -n "$label" ] && [ "$label" != "$title" -o "$title" != "$window" ] && { printf '%s' "$label"; return; }
+  fi
   if ! is_generic_window "$window"; then printf '%s' "$window"; return; fi
-  printf 'unlabeled · %s' "$(repo_name "$cwd")"
+  printf 'unlabeled · %s' "$repo"
 }
 
 detect_prompt() {
@@ -99,14 +111,14 @@ age_human() {
 }
 
 scan() {
-  local filter="${1:-all}" dir panes psfile mapfile pane session win_idx win_name cmd cwd pid last agent stat icon label loc age order kind
+  local filter="${1:-all}" dir panes psfile mapfile pane session win_idx win_name cmd cwd pid last title agent stat icon label loc age order kind
   dir="$(mktemp -d "${TMPDIR:-/tmp}/agent-radar.XXXXXX")" || exit 1
   panes="$dir/panes"; psfile="$dir/ps"; mapfile="$dir/map"
-  tmux list-panes -a -F '#{pane_id}	#{session_name}	#{window_index}	#{window_name}	#{pane_current_command}	#{pane_current_path}	#{pane_pid}	#{window_activity}' >"$panes"
+  tmux list-panes -a -F '#{pane_id}	#{session_name}	#{window_index}	#{window_name}	#{pane_current_command}	#{pane_current_path}	#{pane_pid}	#{window_activity}	#{pane_title}' >"$panes"
   ps -axo pid=,ppid=,comm= >"$psfile"
   awk -v agents="$AGENTS" '
     BEGIN { split(agents,a," "); for (i in a) isagent[a[i]]=1 }
-    ARGIND==1 { root[$7]=$5; next }
+    FNR==NR { root[$7]=$5; next }
     { pid=$1; ppid=$2; cmd=$3; sub(/^.*\//,"",cmd); parent[pid]=ppid; proc[pid]=cmd }
     END {
       for (r in root) if (root[r] in isagent) found[r]=root[r]
@@ -116,7 +128,7 @@ scan() {
       }
       for (r in found) print r "\t" found[r]
     }' "$panes" "$psfile" >"$mapfile"
-  while IFS=$'\t' read -r pane session win_idx win_name cmd cwd pid last; do
+  while IFS=$'\t' read -r pane session win_idx win_name cmd cwd pid last title; do
     last="${last:-$(date +%s)}"
     agent="$(awk -F '\t' -v p="$pid" '$1==p {print $2; exit}' "$mapfile")"
     loc="${session}:${win_idx}:${win_name}"
@@ -125,7 +137,7 @@ scan() {
       kind="agent"
       if detect_prompt "$pane"; then icon="⚠"; stat="WAITING_PERMISSION"
       else IFS=$'\t' read -r icon stat <<<"$(status_from_text "$pane" "$last")"; fi
-      label="$(infer_label "$pane" "$win_name" "$cwd")"
+      label="$(infer_label "$pane" "$win_name" "$cwd" "$title")"
       case "$stat" in WAITING_PERMISSION) order=0;; RUNNING) order=1;; IDLE) order=2;; *) order=3;; esac
     else
       kind="pane"; agent="$cmd"; icon="·"; stat="PANE"; order=4
@@ -177,19 +189,25 @@ tree() {
       if (s=="PANE") return ""
       return s
     }
+    function priority(state, kind) {
+      if (state=="WAITING_PERMISSION") return 0
+      if (state=="RUNNING") return 1
+      if (kind=="agent") return 2
+      return 3
+    }
     function session_header(sess) {
       warn = sess_warn_count[sess] ? "  \033[1;33m⚠ needs you " sess_warn_count[sess] "\033[0m" : ""
       meta = sprintf("%sp", sess_count[sess])
       if (sess_agents_count[sess]) meta = meta " " sess_agents_count[sess] "a"
       text = sprintf("\033[1;36m◆ %s\033[0m  \033[2m%s%s\033[0m", sess, meta, warn)
-      printf "%s\t-\n", text
+      printf "%s\t%s\n", text, sess_target[sess]
     }
     function window_header(key) {
       meta = pane_count[key] "p"
       if (win_agent_count[key]) meta = meta " " win_agent_count[key] "a"
       warn = win_warn_count[key] ? " \033[1;33m⚠ needs you\033[0m" : ""
       text = sprintf("  \033[2m┝\033[0m \033[1m%s\033[0m  \033[2m%s\033[0m%s", winlabels[key], meta, warn)
-      printf "%s\t-\n", text
+      printf "%s\t%s\n", text, win_target[key]
     }
     function pane_line() {
       label=short(f[8],32); cmd=short(f[4],8); s=stat(f[6])
@@ -208,6 +226,9 @@ tree() {
       key=sess SUBSEP idx SUBSEP win
       rows[++n]=$0; sessions[n]=sess; wins[n]=key; winlabels[key]=idx ":" win
       pane_count[key]++; sess_count[sess]++
+      pr=priority($6,$10)
+      if (!(sess in sess_pri) || pr < sess_pri[sess]) { sess_pri[sess]=pr; sess_target[sess]=$2 }
+      if (!(key in win_pri) || pr < win_pri[key]) { win_pri[key]=pr; win_target[key]=$2 }
       if ($10=="agent") { sess_agents_count[sess]++; win_agent_count[key]++ }
       if ($6=="WAITING_PERMISSION") { sess_warn_count[sess]++; win_warn_count[key]++ }
     }
