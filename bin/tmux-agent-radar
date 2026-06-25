@@ -286,25 +286,22 @@ toggle() {
 
 ui() {
   has fzf || { echo "tmux-agent-radar needs fzf for the popup UI" >&2; exit 1; }
-  local reload_all reload_agents reload_prompts
-  reload_all="$SCRIPT tree"
-  reload_agents="$SCRIPT tree agents"
-  reload_prompts="$SCRIPT tree prompts"
-  tree | fzf --ansi --no-multi --height=100% --layout=reverse --border=none \
+  local mode="${1:-all}" next prompt header
+  if [ "$mode" = "agents" ]; then
+    next="all"; prompt="agents › "; header="↵ jump  ^F/esc close  ^G show all"
+  else
+    mode="all"; next="agents"; prompt="all › "; header="↵ jump  ^F/esc close  ^G agents only"
+  fi
+  tree "$mode" | fzf --ansi --no-multi --height=100% --layout=reverse --border=none \
     --margin=0 --padding='1,2' --info=inline-right --highlight-line \
-    --prompt='tmux › ' --pointer='▌' --marker='✓ ' --scrollbar='▌' \
+    --prompt="$prompt" --pointer='▌' --marker='✓ ' --scrollbar='▌' \
     --color='bg:-1,bg+:-1,gutter:-1,border:#4f4946,label:#89b482,prompt:#7daea3,pointer:#ea6962,marker:#a9b665,header:#928374,info:#928374,hl:#d8a657,hl+:#d8a657,fg:#d4be98,fg+:#f2e5bc' \
     --delimiter=$'\t' --with-nth='1' \
     --preview="$SCRIPT preview {2}" --preview-window='right,50%,border-rounded,nowrap,noinfo' --preview-label=' preview ' --preview-label-pos=2 \
-    --header='↵ jump  ^F/esc close  ^L label  ^W window  ^P prompts  ^G agents  ^A all' \
+    --header="$header" \
     --bind="ctrl-f:abort" \
     --bind="enter:become($SCRIPT jump {2})" \
-    --bind="ctrl-l:become($SCRIPT label {2})" \
-    --bind="ctrl-w:become($SCRIPT rename-window {2})" \
-    --bind="ctrl-p:reload($reload_prompts)" \
-    --bind="ctrl-g:reload($reload_agents)" \
-    --bind="ctrl-a:reload($reload_all)" \
-    --bind="ctrl-k:execute-silent($SCRIPT kill {2})+reload($reload_all)"
+    --bind="ctrl-g:become($SCRIPT ui $next)"
 }
 
 jump() {

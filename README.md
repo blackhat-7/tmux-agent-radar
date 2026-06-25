@@ -45,12 +45,7 @@ Keys:
 | --- | --- |
 | `Enter` | jump to pane |
 | `Ctrl-F` | close popup; makes `prefix + C-f` feel like a toggle inside the popup |
-| `Ctrl-L` | label selected pane |
-| `Ctrl-W` | rename selected tmux window |
-| `Ctrl-P` | show only permission prompts |
-| `Ctrl-G` | show only agent panes |
-| `Ctrl-A` | show all panes |
-| `Ctrl-K` | kill pane, with tmux confirmation |
+| `Ctrl-G` | toggle all panes / agent panes only |
 | `Esc` | close |
 | `prefix + C-f` | open popup; when already inside the popup, it closes via `Ctrl-F` |
 
