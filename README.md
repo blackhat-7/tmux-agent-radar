@@ -6,7 +6,7 @@ It scans tmux panes for agents like `pi`, `opencode`, `claude`, `codex`, `gemini
 
 This is intentionally a passive radar. It does **not** approve, reject, or type into agent prompts from the popup; jump to the pane and answer there.
 
-![tmux-agent-radar demo](assets/demo.gif)
+![tmux-agent-radar screenshot](assets/screenshot.png)
 
 ## Features
 
@@ -26,16 +26,6 @@ This is intentionally a passive radar. It does **not** approve, reject, or type 
 - `Ctrl-F` or `Esc`: close the popup
 
 Not supported from the popup: approving, denying, rejecting, editing labels, renaming windows, or killing panes.
-
-## Demo recording
-
-The demo GIF is recorded from a disposable nested tmux session using the real plugin UI, not hand-drawn. To regenerate it:
-
-```sh
-scripts/record-demo.sh
-```
-
-`record-demo.sh` prefers [VHS](https://github.com/charmbracelet/vhs), and can fall back to `asciinema` + `agg`.
 
 ## Requirements
 
