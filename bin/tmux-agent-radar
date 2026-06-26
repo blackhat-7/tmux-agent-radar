@@ -182,6 +182,7 @@ tree() {
   local filter="${1:-all}"
   rows "$filter" | sort -t $'\t' -k5,5 -k1,1n | awk -F '\t' '
     function short(s,n){ return length(s)>n ? substr(s,1,n-1) "…" : s }
+    function plural(n,one,many){ return n " " (n==1 ? one : many) }
     function stat(s){
       if (s=="WAITING_PERMISSION") return "PERMISSION"
       if (s=="RUNNING") return "RUN"
@@ -197,29 +198,29 @@ tree() {
       return 3
     }
     function session_header(sess) {
-      warn = sess_warn_count[sess] ? "  \033[1;33m⚠ needs you " sess_warn_count[sess] "\033[0m" : ""
-      meta = sprintf("%sp", sess_count[sess])
-      if (sess_agents_count[sess]) meta = meta " " sess_agents_count[sess] "a"
-      text = sprintf("\033[1;36m◆ %s\033[0m  \033[2m%s%s\033[0m", sess, meta, warn)
+      warn = sess_warn_count[sess] ? "  \033[1;33m⚠ " sess_warn_count[sess] "\033[0m" : ""
+      meta = plural(sess_count[sess], "pane", "panes")
+      if (sess_agents_count[sess]) meta = meta " · " plural(sess_agents_count[sess], "agent", "agents")
+      text = sprintf("\033[2m╭─\033[0m \033[1;36m◆ %s\033[0m  \033[2m%s\033[0m%s", sess, meta, warn)
       printf "%s\t%s\n", text, sess_target[sess]
     }
     function window_header(key) {
       meta = pane_count[key] "p"
-      if (win_agent_count[key]) meta = meta " " win_agent_count[key] "a"
-      warn = win_warn_count[key] ? " \033[1;33m⚠ needs you\033[0m" : ""
-      text = sprintf("  \033[2m┝\033[0m \033[1m%s\033[0m  \033[2m%s\033[0m%s", winlabels[key], meta, warn)
+      if (win_agent_count[key]) meta = meta " · " win_agent_count[key] "a"
+      warn = win_warn_count[key] ? "  \033[1;33mneeds you\033[0m" : ""
+      text = sprintf("   \033[2m›\033[0m \033[1m%-22s\033[0m \033[2m%s\033[0m%s", short(winlabels[key],22), meta, warn)
       printf "%s\t%s\n", text, win_target[key]
     }
     function pane_line() {
-      label=short(f[8],32); cmd=short(f[4],8); s=stat(f[6])
+      label=short(f[8],34); cmd=short(f[4],9); s=stat(f[6])
       if (f[6]=="WAITING_PERMISSION")
-        text = sprintf("  \033[2m│\033[0m \033[1;33m⚠ %-8s PERMISSION  %s\033[0m  %s", cmd, f[7], label)
+        text = sprintf("      \033[1;33m⚠ %-9s\033[0m \033[33mPERM\033[0m \033[2m%-4s\033[0m %s", cmd, f[7], label)
       else if (f[6]=="RUNNING")
-        text = sprintf("  \033[2m│\033[0m \033[32m▶\033[0m %-8s \033[2mRUN  %-4s\033[0m %s", cmd, f[7], label)
+        text = sprintf("      \033[32m▶ %-9s\033[0m \033[32mRUN \033[0m \033[2m%-4s\033[0m %s", cmd, f[7], label)
       else if (f[10]=="agent")
-        text = sprintf("  \033[2m│\033[0m \033[2m%s\033[0m %-8s \033[2m%-4s %-4s\033[0m %s", f[3], cmd, s, f[7], label)
+        text = sprintf("      \033[2m%s\033[0m %-9s \033[2m%-4s %-4s\033[0m %s", f[3], cmd, s, f[7], label)
       else
-        text = sprintf("  \033[2m│\033[0m \033[2m·\033[0m %-8s \033[2m     %-4s\033[0m %s", cmd, f[7], label)
+        text = sprintf("      \033[2m·\033[0m %-9s \033[2m     %-4s\033[0m %s", cmd, f[7], label)
       printf "%s\t%s\n", text, f[2]
     }
     {
@@ -317,8 +318,8 @@ ui() {
   save_mode "$mode"
   tree "$mode" | fzf --ansi --no-multi --height=100% --layout=reverse --border=none \
     --margin=0 --padding='1,2' --info=inline-right --highlight-line \
-    --prompt="$prompt" --pointer='▌' --marker='✓ ' --scrollbar='▌' \
-    --color='bg:-1,bg+:-1,gutter:-1,border:#4f4946,label:#89b482,prompt:#7daea3,pointer:#ea6962,marker:#a9b665,header:#928374,info:#928374,hl:#d8a657,hl+:#d8a657,fg:#d4be98,fg+:#f2e5bc' \
+    --prompt="$prompt" --pointer='❯' --marker='✓ ' --no-scrollbar \
+    --color='bg:-1,bg+:#282828,gutter:-1,border:#4f4946,label:#89b482,prompt:#7daea3,pointer:#d8a657,marker:#a9b665,header:#928374,info:#928374,hl:#d8a657,hl+:#f2e5bc,fg:#d4be98,fg+:#f2e5bc' \
     --delimiter=$'\t' --with-nth='1' \
     --preview="$SCRIPT preview {2}" --preview-window='right,50%,border-rounded,nowrap,noinfo' --preview-label=' preview ' --preview-label-pos=2 \
     --header="$header" \
