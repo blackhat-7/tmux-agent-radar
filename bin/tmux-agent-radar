@@ -8,6 +8,7 @@ AGENTS="${AGENTS:-$AGENTS_DEFAULT}"
 GENERIC_WINDOWS="fish zsh bash sh tmux vim nvim vi node python python3"
 STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/tmux-agent-radar"
 CACHE="$STATE_DIR/rows.tsv"
+MODE_FILE="$STATE_DIR/mode"
 
 has() { command -v "$1" >/dev/null 2>&1; }
 trim() { awk '{$1=$1;print}'; }
@@ -269,6 +270,24 @@ popup_marker() {
   printf '%s/popup.%s' "$STATE_DIR" "$(printf '%s' "$1" | tr -c 'A-Za-z0-9_.-' '_')"
 }
 
+saved_mode() {
+  local mode
+  mode="$(cat "$MODE_FILE" 2>/dev/null || true)"
+  case "$mode" in
+    all|agents) printf '%s' "$mode" ;;
+    *) printf 'all' ;;
+  esac
+}
+
+save_mode() {
+  case "$1" in
+    all|agents)
+      mkdir -p "$STATE_DIR"
+      printf '%s\n' "$1" >"$MODE_FILE"
+      ;;
+  esac
+}
+
 toggle() {
   local client="${1:-}" width="${2:-92%}" height="${3:-88%}" marker
   local target=()
@@ -289,12 +308,13 @@ ui() {
   mkdir -p "$STATE_DIR"
   local tmp="$CACHE.$$"
   scan >"$tmp" && mv "$tmp" "$CACHE"
-  local mode="${1:-all}" next prompt header
+  local mode="${1:-$(saved_mode)}" next prompt header
   if [ "$mode" = "agents" ]; then
     next="all"; prompt="agents › "; header="↵ jump  ^A show all  ^F/esc close"
   else
     mode="all"; next="agents"; prompt="all › "; header="↵ jump  ^A agents only  ^F/esc close"
   fi
+  save_mode "$mode"
   tree "$mode" | fzf --ansi --no-multi --height=100% --layout=reverse --border=none \
     --margin=0 --padding='1,2' --info=inline-right --highlight-line \
     --prompt="$prompt" --pointer='▌' --marker='✓ ' --scrollbar='▌' \
@@ -379,7 +399,7 @@ status() {
 }
 
 case "${1:-ui}" in
-  ui) ui "${2:-all}" ;;
+  ui) ui "${2:-}" ;;
   toggle) toggle "${2:-}" "${3:-92%}" "${4:-88%}" ;;
   rows|list) rows "${2:-all}" ;;
   view) view "${2:-all}" ;;

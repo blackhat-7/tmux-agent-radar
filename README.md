@@ -15,6 +15,7 @@ This is intentionally a passive radar. It does **not** approve, reject, or type 
 - Permission-prompt detection from visible pane text
 - Raw recent-output preview before jumping
 - Agents-only / all-panes toggle with `Ctrl-A`
+- Remembers the last all-panes / agents-only mode
 - Jump to the selected pane with `Enter`
 - Optional status-bar badge: `🤖4 ⚠1 ▶2`
 - Optional tmux or macOS notifications for permission prompts
