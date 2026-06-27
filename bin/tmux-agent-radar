@@ -112,10 +112,10 @@ age_human() {
 }
 
 scan() {
-  local filter="${1:-all}" dir panes psfile mapfile pane session win_idx win_name cmd cwd pid last title agent stat icon label loc age order kind
+  local filter="${1:-all}" dir panes psfile mapfile pane session win_idx win_name cmd cwd pid last title sess_last agent stat icon label loc age order kind
   dir="$(mktemp -d "${TMPDIR:-/tmp}/agent-radar.XXXXXX")" || exit 1
   panes="$dir/panes"; psfile="$dir/ps"; mapfile="$dir/map"
-  tmux list-panes -a -F '#{pane_id}	#{session_name}	#{window_index}	#{window_name}	#{pane_current_command}	#{pane_current_path}	#{pane_pid}	#{window_activity}	#{pane_title}' >"$panes"
+  tmux list-panes -a -F '#{pane_id}	#{session_name}	#{window_index}	#{window_name}	#{pane_current_command}	#{pane_current_path}	#{pane_pid}	#{window_activity}	#{pane_title}	#{session_last_attached}' >"$panes"
   ps -axo pid=,ppid=,comm= >"$psfile"
   awk -v agents="$AGENTS" '
     BEGIN { split(agents,a," "); for (i in a) isagent[a[i]]=1 }
@@ -129,8 +129,9 @@ scan() {
       }
       for (r in found) print r "\t" found[r]
     }' "$panes" "$psfile" >"$mapfile"
-  while IFS=$'\t' read -r pane session win_idx win_name cmd cwd pid last title; do
+  while IFS=$'\t' read -r pane session win_idx win_name cmd cwd pid last title sess_last; do
     last="${last:-$(date +%s)}"
+    sess_last="${sess_last:-0}"
     agent="$(awk -F '\t' -v p="$pid" '$1==p {print $2; exit}' "$mapfile")"
     loc="${session}:${win_idx}:${win_name}"
     age="$(age_human "$last")"
@@ -147,8 +148,8 @@ scan() {
     fi
     [ "$filter" = "prompts" ] && [ "$stat" != "WAITING_PERMISSION" ] && continue
     [ "$filter" = "agents" ] && [ "$kind" != "agent" ] && continue
-    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$order" "$pane" "$icon" "$agent" "$loc" "$stat" "$age" "$label" "$cwd" "$kind"
-  done <"$panes" | sort -t $'\t' -k1,1n -k5,5
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$order" "$pane" "$icon" "$agent" "$loc" "$stat" "$age" "$label" "$cwd" "$kind" "$sess_last"
+  done <"$panes" | sort -t $'\t' -k11,11nr -k5,5 -k1,1n
   rm -rf "$dir"
 }
 
@@ -180,7 +181,7 @@ view() {
 
 tree() {
   local filter="${1:-all}"
-  rows "$filter" | sort -t $'\t' -k5,5 -k1,1n | awk -F '\t' '
+  rows "$filter" | sort -t $'\t' -k11,11nr -k5,5 -k1,1n | awk -F '\t' '
     function short(s,n){ return length(s)>n ? substr(s,1,n-1) "…" : s }
     function plural(n,one,many){ return n " " (n==1 ? one : many) }
     function stat(s){
