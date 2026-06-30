@@ -191,54 +191,37 @@ tree() {
       if (s=="PANE") return ""
       return s
     }
-    function priority(state, kind) {
-      if (state=="WAITING_PERMISSION") return 0
-      if (state=="RUNNING") return 1
-      if (kind=="agent") return 2
-      return 3
-    }
     function session_label(sess) {
       if (sess_warn_count[sess])
-        return sprintf("\033[1;36m◆ %-10s\033[0m \033[1;33m⚠%-2s\033[0m", short(sess,10), sess_warn_count[sess])
-      return sprintf("\033[1;36m◆ %-13s\033[0m", short(sess,13))
+        return sprintf("\033[1;36m◆ %-11s\033[0m \033[1;33m⚠%-2s\033[0m", short(sess,11), sess_warn_count[sess])
+      return sprintf("\033[1;36m◆ %-15s\033[0m", short(sess,15))
     }
-    function window_header(key, sess, first) {
-      meta = pane_count[key] "p"
-      if (win_agent_count[key]) meta = meta " · " win_agent_count[key] "a"
-      warn = win_warn_count[key] ? "  \033[1;33mneeds you\033[0m" : ""
-      left = first ? session_label(sess) : "\033[2m│              \033[0m"
-      text = sprintf("%s \033[2m├─\033[0m \033[1m%-22s\033[0m \033[2m%s\033[0m%s", left, short(winlabels[key],22), meta, warn)
-      printf "%s\t%s\n", text, win_target[key]
-    }
-    function pane_line() {
+    function pane_text() {
       label=short(f[8],34); cmd=short(f[4],9); s=stat(f[6])
       if (f[6]=="WAITING_PERMISSION")
-        text = sprintf("\033[2m│              │\033[0m  \033[1;33m⚠ %-9s\033[0m \033[33mPERM\033[0m \033[2m%-4s\033[0m %s", cmd, f[7], label)
-      else if (f[6]=="RUNNING")
-        text = sprintf("\033[2m│              │\033[0m  \033[32m▶ %-9s\033[0m \033[32mRUN \033[0m \033[2m%-4s\033[0m %s", cmd, f[7], label)
-      else if (f[10]=="agent")
-        text = sprintf("\033[2m│              │\033[0m  \033[2m%s\033[0m %-9s \033[2m%-4s %-4s\033[0m %s", f[3], cmd, s, f[7], label)
-      else
-        text = sprintf("\033[2m│              │\033[0m  \033[2m·\033[0m %-9s \033[2m     %-4s\033[0m %s", cmd, f[7], label)
-      printf "%s\t%s\n", text, f[2]
+        return sprintf("\033[1;33m⚠ %-9s\033[0m \033[33mPERM\033[0m \033[2m%-4s\033[0m %s", cmd, f[7], label)
+      if (f[6]=="RUNNING")
+        return sprintf("\033[32m▶ %-9s\033[0m \033[32mRUN \033[0m \033[2m%-4s\033[0m %s", cmd, f[7], label)
+      if (f[10]=="agent")
+        return sprintf("\033[2m%s\033[0m %-9s \033[2m%-4s %-4s\033[0m %s", f[3], cmd, s, f[7], label)
+      return sprintf("\033[2m·\033[0m %-9s \033[2m     %-4s\033[0m %s", cmd, f[7], label)
     }
     {
       split($5,a,":"); sess=a[1]; idx=a[2]; win=substr($5,length(sess)+length(idx)+3)
       key=sess SUBSEP idx SUBSEP win
       rows[++n]=$0; sessions[n]=sess; wins[n]=key; winlabels[key]=idx ":" win
-      pane_count[key]++; sess_count[sess]++
-      pr=priority($6,$10)
-      if (!(key in win_pri) || pr < win_pri[key]) { win_pri[key]=pr; win_target[key]=$2 }
-      if ($10=="agent") { sess_agents_count[sess]++; win_agent_count[key]++ }
-      if ($6=="WAITING_PERMISSION") { sess_warn_count[sess]++; win_warn_count[key]++ }
+      if ($6=="WAITING_PERMISSION") sess_warn_count[sess]++
     }
     END {
       for (i=1;i<=n;i++) {
         split(rows[i],f,"\t"); sess=sessions[i]; key=wins[i]
-        first = (sess != last_session)
-        if (first) { last_session=sess; last_window="" }
-        if (key != last_window) { window_header(key, sess, first); last_window=key }
-        pane_line()
+        new_sess = (sess != last_session)
+        new_win = new_sess || (key != last_window)
+        left = new_sess ? session_label(sess) : "\033[2m│                \033[0m"
+        win = new_win ? sprintf("\033[2m├─\033[0m \033[1m%-14s\033[0m", short(winlabels[key],14)) : "\033[2m│\033[0m  " sprintf("%-14s", "")
+        printf "%s %s %s\t%s\n", left, win, pane_text(), f[2]
+        if (new_sess) last_session=sess
+        if (new_win) last_window=key
       }
     }'
 }
