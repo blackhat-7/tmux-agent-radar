@@ -183,6 +183,7 @@ tree() {
   local filter="${1:-all}"
   rows "$filter" | sort -t $'\t' -k11,11nr -k5,5 -k1,1n | awk -F '\t' '
     function short(s,n){ return length(s)>n ? substr(s,1,n-1) "…" : s }
+    function plural(n,one,many){ return n " " (n==1 ? one : many) }
     function stat(s){
       if (s=="WAITING_PERMISSION") return "PERMISSION"
       if (s=="RUNNING") return "RUN"
@@ -197,39 +198,46 @@ tree() {
       if (kind=="agent") return 2
       return 3
     }
+    function session_header(sess) {
+      warn = sess_warn_count[sess] ? "  \033[1;33m⚠ " sess_warn_count[sess] "\033[0m" : ""
+      meta = plural(sess_count[sess], "pane", "panes")
+      if (sess_agents_count[sess]) meta = meta " · " plural(sess_agents_count[sess], "agent", "agents")
+      text = sprintf("\033[2m╭─\033[0m \033[1;36m◆ %s\033[0m  \033[2m%s\033[0m%s", sess, meta, warn)
+      printf "%s\t-\n", text
+    }
     function window_header(key) {
       meta = pane_count[key] "p"
       if (win_agent_count[key]) meta = meta " · " win_agent_count[key] "a"
       warn = win_warn_count[key] ? "  \033[1;33mneeds you\033[0m" : ""
-      text = sprintf("   \033[2m›\033[0m \033[1m%-34s\033[0m \033[2m%s\033[0m%s", short(win_session[key] ":" winlabels[key],34), meta, warn)
+      text = sprintf("   \033[2m├─\033[0m \033[1m%-22s\033[0m \033[2m%s\033[0m%s", short(winlabels[key],22), meta, warn)
       printf "%s\t%s\n", text, win_target[key]
     }
     function pane_line() {
       label=short(f[8],34); cmd=short(f[4],9); s=stat(f[6])
       if (f[6]=="WAITING_PERMISSION")
-        text = sprintf("      \033[1;33m⚠ %-9s\033[0m \033[33mPERM\033[0m \033[2m%-4s\033[0m %s", cmd, f[7], label)
+        text = sprintf("   \033[2m│\033[0m  \033[1;33m⚠ %-9s\033[0m \033[33mPERM\033[0m \033[2m%-4s\033[0m %s", cmd, f[7], label)
       else if (f[6]=="RUNNING")
-        text = sprintf("      \033[32m▶ %-9s\033[0m \033[32mRUN \033[0m \033[2m%-4s\033[0m %s", cmd, f[7], label)
+        text = sprintf("   \033[2m│\033[0m  \033[32m▶ %-9s\033[0m \033[32mRUN \033[0m \033[2m%-4s\033[0m %s", cmd, f[7], label)
       else if (f[10]=="agent")
-        text = sprintf("      \033[2m%s\033[0m %-9s \033[2m%-4s %-4s\033[0m %s", f[3], cmd, s, f[7], label)
+        text = sprintf("   \033[2m│\033[0m  \033[2m%s\033[0m %-9s \033[2m%-4s %-4s\033[0m %s", f[3], cmd, s, f[7], label)
       else
-        text = sprintf("      \033[2m·\033[0m %-9s \033[2m     %-4s\033[0m %s", cmd, f[7], label)
+        text = sprintf("   \033[2m│\033[0m  \033[2m·\033[0m %-9s \033[2m     %-4s\033[0m %s", cmd, f[7], label)
       printf "%s\t%s\n", text, f[2]
     }
     {
       split($5,a,":"); sess=a[1]; idx=a[2]; win=substr($5,length(sess)+length(idx)+3)
       key=sess SUBSEP idx SUBSEP win
-      rows[++n]=$0; sessions[n]=sess; wins[n]=key; winlabels[key]=idx ":" win; win_session[key]=sess
-      pane_count[key]++
+      rows[++n]=$0; sessions[n]=sess; wins[n]=key; winlabels[key]=idx ":" win
+      pane_count[key]++; sess_count[sess]++
       pr=priority($6,$10)
       if (!(key in win_pri) || pr < win_pri[key]) { win_pri[key]=pr; win_target[key]=$2 }
-      if ($10=="agent") win_agent_count[key]++
-      if ($6=="WAITING_PERMISSION") win_warn_count[key]++
+      if ($10=="agent") { sess_agents_count[sess]++; win_agent_count[key]++ }
+      if ($6=="WAITING_PERMISSION") { sess_warn_count[sess]++; win_warn_count[key]++ }
     }
     END {
       for (i=1;i<=n;i++) {
         split(rows[i],f,"\t"); sess=sessions[i]; key=wins[i]
-        if (sess != last_session) { last_session=sess; last_window="" }
+        if (sess != last_session) { session_header(sess); last_session=sess; last_window="" }
         if (key != last_window) { window_header(key); last_window=key }
         pane_line()
       }
@@ -301,13 +309,15 @@ ui() {
   mkdir -p "$STATE_DIR"
   local tmp="$CACHE.$$"
   scan >"$tmp" && mv "$tmp" "$CACHE"
-  local mode="${1:-$(saved_mode)}" next prompt header
+  local mode="${1:-$(saved_mode)}" next prompt header skip_down skip_up
   if [ "$mode" = "agents" ]; then
     next="all"; prompt="agents › "; header="↵ jump  ^A show all  ^F/esc close"
   else
     mode="all"; next="agents"; prompt="all › "; header="↵ jump  ^A agents only  ^F/esc close"
   fi
   save_mode "$mode"
+  skip_down='case {2} in %*) ;; *) echo down;; esac'
+  skip_up='case {2} in %*) ;; *) echo up;; esac'
   tree "$mode" | fzf --ansi --no-multi --height=100% --layout=reverse --border=none \
     --margin=0 --padding='1,2' --info=inline-right --highlight-line \
     --prompt="$prompt" --pointer='❯' --marker='✓ ' --no-scrollbar \
@@ -315,6 +325,9 @@ ui() {
     --delimiter=$'\t' --with-nth='1' \
     --preview="$SCRIPT preview {2}" --preview-window='right,50%,border-rounded,nowrap,noinfo' --preview-label=' preview ' --preview-label-pos=2 \
     --header="$header" \
+    --bind="load:transform:$skip_down" \
+    --bind="down:down+transform:$skip_down" \
+    --bind="up:up+transform:$skip_up" \
     --bind="ctrl-f:abort" \
     --bind="enter:become($SCRIPT jump {2})" \
     --bind="ctrl-a:become($SCRIPT ui $next)"
