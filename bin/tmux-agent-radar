@@ -3,18 +3,48 @@ set -uo pipefail
 
 SCRIPT="$0"
 AGENTS_DEFAULT="pi opencode claude codex gemini aider cursor-agent goose amp qwen"
-AGENTS="${TMUX_AGENT_RADAR_AGENTS:-$(tmux show -gqv @agent-radar-agents 2>/dev/null || true)}"
-AGENTS="${AGENTS:-$AGENTS_DEFAULT}"
+AGENTS=""
 GENERIC_WINDOWS="fish zsh bash sh tmux vim nvim vi node python python3"
 STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/tmux-agent-radar"
 CACHE="$STATE_DIR/rows.tsv"
 MODE_FILE="$STATE_DIR/mode"
+PROMPT_CACHE="$STATE_DIR/prompts.tsv"
+CACHE_TTL=10
+
+# A permission prompt is a choice UI sitting at the bottom of the screen, so the
+# patterns are matched (lowercased) against the last few non-blank lines only.
+# Matching the whole screen misreads any pane that merely *talks* about
+# approving commands. Extend with: set -g @agent-radar-prompt-extra '<regex>'
+PROMPT_RE='(^|\n)[[:space:]]*(❯|>|\*)?[[:space:]]*[0-9][.)][[:space:]]+(yes|no|allow|deny|approve|don.t)'
+PROMPT_RE="$PROMPT_RE"'|do you want to (proceed|continue|allow|make|create|run|use)'
+PROMPT_RE="$PROMPT_RE"'|\(y(es)?/n(o)?\)|\(y\)es|\[y/n\]'
+PROMPT_RE="$PROMPT_RE"'|allow (this |the )?(command|tool|edit|write|action|request)'
+PROMPT_RE="$PROMPT_RE"'|permission (required|needed|request)'
+PROMPT_RE="$PROMPT_RE"'|press (enter|y) to (confirm|continue|approve)'
+PROMPT_RE="$PROMPT_RE"'|waiting for (your )?(approval|confirmation)'
+
+load_agents() {
+  [ -n "$AGENTS" ] && return
+  local opt; opt="$(tmux show -gqv @agent-radar-agents 2>/dev/null || true)"
+  AGENTS="${TMUX_AGENT_RADAR_AGENTS:-${opt:-$AGENTS_DEFAULT}}"
+}
 
 has() { command -v "$1" >/dev/null 2>&1; }
-trim() { awk '{$1=$1;print}'; }
+now_epoch() { printf '%(%s)T' -1; }
 
 pane_opt() { tmux show-option -p -v -t "$1" "$2" 2>/dev/null || true; }
-set_pane_opt() { tmux set-option -p -t "$1" "$2" "$3" >/dev/null; }
+
+# stat(1) is BSD on darwin, GNU elsewhere; probe once per process, lazily.
+stat_init() {
+  [ -n "${STAT_FMT+x}" ] && return
+  if stat -f '%m' /dev/null >/dev/null 2>&1; then STAT_FMT=(-f '%m %N')
+  else STAT_FMT=(-c '%Y %n'); fi
+}
+
+# One fork for every path handed in.
+mtimes() { stat_init; stat "${STAT_FMT[@]}" "$@" 2>/dev/null; }
+
+file_mtime() { local m rest; read -r m rest < <(mtimes "$1"); printf '%s' "${m:-0}"; }
 
 capture() {
   local pane="$1"
@@ -27,36 +57,6 @@ capture_visible() {
   tmux capture-pane -p -J -S 0 -t "$pane" 2>/dev/null || true
 }
 
-descendants() {
-  local pid="$1" kids kid
-  kids="$(pgrep -P "$pid" 2>/dev/null || true)"
-  for kid in $kids; do
-    printf '%s\n' "$kid"
-    descendants "$kid"
-  done
-}
-
-cmd_name() {
-  local pid="$1" c
-  c="$(ps -p "$pid" -o comm= 2>/dev/null | head -1 | xargs basename 2>/dev/null || true)"
-  printf '%s' "$c"
-}
-
-cmd_args() { ps -p "$1" -o args= 2>/dev/null | head -1 || true; }
-
-agent_from_pane() {
-  local current="$1" pid="$2" a p c args
-  for a in $AGENTS; do [ "$current" = "$a" ] && { printf '%s' "$a"; return; }; done
-  for p in "$pid" $(descendants "$pid"); do
-    c="$(cmd_name "$p")"; args=" $(cmd_args "$p") "
-    for a in $AGENTS; do
-      if [ "$c" = "$a" ] || [[ "$args" == *"/$a "* ]] || [[ "$args" == *" $a "* ]]; then
-        printf '%s' "$a"; return
-      fi
-    done
-  done
-}
-
 is_generic_window() {
   local w="$1" a g
   for g in $GENERIC_WINDOWS; do [ "$w" = "$g" ] && return 0; done
@@ -64,62 +64,82 @@ is_generic_window() {
   return 1
 }
 
-repo_name() { basename "$1"; }
-
-clean_title() {
-  local title="$1" repo="$2"
-  title="${title#π - }"; title="${title#🤖 }"
-  title="${title% - $repo}"
-  printf '%s' "$title" | cut -c1-34
-}
-
+# Sets LABEL. Called once per pane, so it assigns to a global rather than
+# echoing: "$(infer_label ...)" would fork a subshell on every row.
+# $1 is the already-resolved @agent-radar-label (empty when unset).
 infer_label() {
-  local pane="$1" window="$2" cwd="$3" title="${4:-}" label repo
-  repo="$(repo_name "$cwd")"
-  label="$(pane_opt "$pane" @agent-radar-label)"
-  [ -n "$label" ] && { printf '%s' "$label"; return; }
+  local label="$1" window="$2" cwd="$3" title="${4:-}" repo="${3##*/}"
+  if [ -n "$label" ]; then LABEL="$label"; return; fi
   if [ -n "$title" ] && [ "$title" != "$window" ]; then
-    label="$(clean_title "$title" "$repo")"
-    [ -n "$label" ] && [ "$label" != "$title" -o "$title" != "$window" ] && { printf '%s' "$label"; return; }
+    title="${title#π - }"; title="${title#🤖 }"; title="${title% - $repo}"
+    LABEL="${title:0:34}"
+    [ -n "$LABEL" ] && return
   fi
-  if ! is_generic_window "$window"; then printf '%s' "$window"; return; fi
-  printf 'unlabeled · %s' "$repo"
+  if ! is_generic_window "$window"; then LABEL="$window"; return; fi
+  LABEL="unlabeled · $repo"
 }
 
+# Matches $2 (an ERE) against the last 15 non-blank lines of the visible pane.
 detect_prompt() {
-  local pane="$1" lower
-  lower="$(capture_visible "$pane" | tr '[:upper:]' '[:lower:]')"
-  printf '%s' "$lower" | grep -Eq '(allow|approve|deny).*(command|tool|edit|write|run|permission)|permission.*(required|prompt|needed)|do you want to (continue|proceed)|run this command|\[(y/n|y/n)\]|yes/no'
+  local pane="$1" re="$2" line text="" i n
+  local -a lines=()
+  while IFS= read -r line; do
+    [ -z "${line//[[:space:]]/}" ] || lines+=("$line")
+  done < <(capture_visible "$pane")
+  n=${#lines[@]}; i=$(( n - 15 )); (( i < 0 )) && i=0
+  for (( ; i < n; i++ )); do text+="${lines[i]}"$'\n'; done
+  [[ "${text,,}" =~ $re ]]
 }
 
-status_from_text() {
-  local pane="$1" last="$2" now age cached icon
-  cached="$(pane_opt "$pane" @agent-radar-status)"
-  icon="$(pane_opt "$pane" @agent-radar-icon)"
-  if [ -n "$cached" ]; then printf '%s\t%s' "${icon:-?}" "$cached"; return; fi
-  now="$(date +%s)"; age=$(( now - last ))
-  if [ "$age" -lt 12 ]; then printf '▶\tRUNNING'; return; fi
-  if [ "$age" -lt 300 ]; then printf '○\tIDLE'; return; fi
-  printf '◌\tSTALE'
-}
-
+# Sets AGE, for the same reason as infer_label.
 age_human() {
-  local last="$1" now d
-  now="$(date +%s)"; d=$(( now - last ))
-  if [ "$d" -lt 60 ]; then printf '%ss' "$d"
-  elif [ "$d" -lt 3600 ]; then printf '%sm' $((d/60))
-  else printf '%sh' $((d/3600)); fi
+  local d="$1"
+  if [ "$d" -lt 60 ]; then AGE="${d}s"
+  elif [ "$d" -lt 3600 ]; then AGE="$((d/60))m"
+  else AGE="$((d/3600))h"; fi
 }
 
 scan() {
-  local filter="${1:-all}" dir panes psfile mapfile pane session win_idx win_name cmd cwd pid last title sess_last agent stat icon label loc age order kind
+  local filter="${1:-all}" dir panes psfile roots out now re
+  local pane session win_idx win_name cmd cwd pid tty title sess_last opt_label
+  local mtime idle agent stat icon loc order kind seen_mtime seen_hit LABEL AGE
+  local -A AGENT_OF=() MT=() PREV_MTIME=() PREV_HIT=()
+  local -a ttys=()
+  local run_secs done_secs idle_secs
+  load_agents
+
+  # One round-trip for every tunable; four separate `tmux show` calls cost ~20ms.
+  # Newline-separated because tab is IFS whitespace: `read -d` would collapse the
+  # empty fields of unset options and shift the remaining values into the wrong
+  # variables.
+  local extra
+  local -a opt=()
+  mapfile -t opt < <(tmux display-message -p '#{@agent-radar-running-secs}
+#{@agent-radar-done-secs}
+#{@agent-radar-idle-secs}
+#{@agent-radar-prompt-extra}' 2>/dev/null)
+  run_secs="${opt[0]:-}"; done_secs="${opt[1]:-}"; idle_secs="${opt[2]:-}"; extra="${opt[3]:-}"
+  [[ "$run_secs"  =~ ^[0-9]+$ ]] || run_secs=5
+  [[ "$done_secs" =~ ^[0-9]+$ ]] || done_secs=120
+  [[ "$idle_secs" =~ ^[0-9]+$ ]] || idle_secs=1800
+  re="$PROMPT_RE"
+  [ -n "$extra" ] && re="$re|$extra"
+
   dir="$(mktemp -d "${TMPDIR:-/tmp}/agent-radar.XXXXXX")" || exit 1
-  panes="$dir/panes"; psfile="$dir/ps"; mapfile="$dir/map"
-  tmux list-panes -a -F '#{pane_id}	#{session_name}	#{window_index}	#{window_name}	#{pane_current_command}	#{pane_current_path}	#{pane_pid}	#{window_activity}	#{pane_title}	#{session_last_attached}' >"$panes"
+  panes="$dir/panes"; psfile="$dir/ps"; roots="$dir/roots"; out="$dir/out"
+  tmux list-panes -a -F '#{pane_id}	#{session_name}	#{window_index}	#{window_name}	#{pane_current_command}	#{pane_current_path}	#{pane_pid}	#{pane_tty}	#{pane_title}	#{session_last_attached}	#{@agent-radar-label}' >"$panes"
   ps -axo pid=,ppid=,comm= >"$psfile"
+  now="$(now_epoch)"
+
+  # Pass 1: pane pid -> command for the agent map, and every tty for one stat(1).
+  while IFS=$'\t' read -r pane session win_idx win_name cmd cwd pid tty title sess_last opt_label; do
+    printf '%s\t%s\n' "$pid" "$cmd" >>"$roots"
+    [ -n "$tty" ] && [ "$tty" != "-" ] && ttys+=("$tty")
+  done <"$panes"
+
   awk -v agents="$AGENTS" '
     BEGIN { split(agents,a," "); for (i in a) isagent[a[i]]=1 }
-    FNR==NR { root[$7]=$5; next }
+    FNR==NR { split($0,rt,"\t"); root[rt[1]]=rt[2]; next }
     { pid=$1; ppid=$2; cmd=$3; sub(/^.*\//,"",cmd); parent[pid]=ppid; proc[pid]=cmd }
     END {
       for (r in root) if (root[r] in isagent) found[r]=root[r]
@@ -128,29 +148,59 @@ scan() {
         while (x && seen++ < 50) { if (x in root) { if (!(x in found)) found[x]=proc[p]; break }; x=parent[x] }
       }
       for (r in found) print r "\t" found[r]
-    }' "$panes" "$psfile" >"$mapfile"
-  while IFS=$'\t' read -r pane session win_idx win_name cmd cwd pid last title sess_last; do
-    last="${last:-$(date +%s)}"
+    }' "$roots" "$psfile" >"$dir/map"
+  while IFS=$'\t' read -r pid agent; do AGENT_OF["$pid"]="$agent"; done <"$dir/map"
+
+  # Per-pane output activity: the pane tty's mtime moves on every write to it.
+  # window_activity is shared by sibling panes and so misreports idle ones.
+  if [ ${#ttys[@]} -gt 0 ]; then
+    while read -r mtime tty; do MT["$tty"]="$mtime"; done < <(mtimes "${ttys[@]}")
+  fi
+
+  # Prompt verdicts are keyed by tty mtime: an unchanged screen cannot have
+  # changed its answer, so steady-state scans capture almost nothing.
+  if [ -r "$PROMPT_CACHE" ]; then
+    while IFS=$'\t' read -r pane seen_mtime seen_hit; do
+      PREV_MTIME["$pane"]="$seen_mtime"; PREV_HIT["$pane"]="$seen_hit"
+    done <"$PROMPT_CACHE"
+  fi
+  : >"$PROMPT_CACHE.$$"
+
+  while IFS=$'\t' read -r pane session win_idx win_name cmd cwd pid tty title sess_last opt_label; do
     sess_last="${sess_last:-0}"
-    agent="$(awk -F '\t' -v p="$pid" '$1==p {print $2; exit}' "$mapfile")"
+    mtime="${MT[$tty]:-0}"
+    [ "$mtime" = 0 ] && mtime="$now"
+    idle=$(( now - mtime )); (( idle < 0 )) && idle=0
+    agent="${AGENT_OF[$pid]:-}"
     loc="${session}:${win_idx}:${win_name}"
-    age="$(age_human "$last")"
     if [ -n "$agent" ]; then
       kind="agent"
-      if detect_prompt "$pane"; then icon="⚠"; stat="WAITING_PERMISSION"
-      else IFS=$'\t' read -r icon stat <<<"$(status_from_text "$pane" "$last")"; fi
-      label="$(infer_label "$pane" "$win_name" "$cwd" "$title")"
-      case "$stat" in WAITING_PERMISSION) order=0;; RUNNING) order=1;; IDLE) order=2;; *) order=3;; esac
+      if [ "${PREV_MTIME[$pane]:-}" = "$mtime" ]; then
+        seen_hit="${PREV_HIT[$pane]:-0}"
+      elif detect_prompt "$pane" "$re"; then seen_hit=1
+      else seen_hit=0; fi
+      printf '%s\t%s\t%s\n' "$pane" "$mtime" "$seen_hit" >>"$PROMPT_CACHE.$$"
+      if [ "$seen_hit" = 1 ]; then icon="⚠"; stat="WAITING_PERMISSION"; order=0
+      elif [ "$idle" -lt "$run_secs" ]; then icon="▶"; stat="RUNNING"; order=1
+      elif [ "$idle" -lt "$done_secs" ]; then icon="✓"; stat="DONE"; order=2
+      elif [ "$idle" -lt "$idle_secs" ]; then icon="○"; stat="IDLE"; order=3
+      else icon="◌"; stat="STALE"; order=4; fi
+      infer_label "$opt_label" "$win_name" "$cwd" "$title"
     else
-      kind="pane"; agent="$cmd"; icon="·"; stat="PANE"; order=4
-      label="$(pane_opt "$pane" @agent-radar-label)"
-      [ -z "$label" ] && label="$win_name · $(repo_name "$cwd")"
+      kind="pane"; agent="$cmd"; icon="·"; stat="PANE"; order=5
+      LABEL="$opt_label"
+      [ -z "$LABEL" ] && LABEL="$win_name · ${cwd##*/}"
     fi
+    age_human "$idle"
     [ "$filter" = "prompts" ] && [ "$stat" != "WAITING_PERMISSION" ] && continue
     [ "$filter" = "agents" ] && [ "$kind" != "agent" ] && continue
-    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$order" "$pane" "$icon" "$agent" "$loc" "$stat" "$age" "$label" "$cwd" "$kind" "$sess_last" "$last"
-  done <"$panes" | sort -t $'\t' -k11,11nr -k5,5 -k1,1n
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$order" "$pane" "$icon" "$agent" "$loc" "$stat" "$AGE" "$LABEL" "$cwd" "$kind" "$sess_last" "$mtime" >>"$out"
+  done <"$panes"
+
+  mv "$PROMPT_CACHE.$$" "$PROMPT_CACHE" 2>/dev/null || rm -f "$PROMPT_CACHE.$$"
+  [ -s "$out" ] && sort -t $'\t' -k11,11nr -k5,5 -k1,1n "$out"
   rm -rf "$dir"
+  return 0
 }
 
 rows() {
@@ -194,7 +244,7 @@ render() {
   printf '%s\n' "$sorted" | awk -F '\t' -v grouped="$grouped" '
     BEGIN {
       FG="38;5;223"; GRAY="38;5;245"; FAINT="38;5;240"
-      GREEN="38;5;142"; ORANGE="38;5;214"; BLUE="38;5;109"
+      GREEN="38;5;142"; ORANGE="38;5;214"; BLUE="38;5;109"; CYAN="38;5;108"
       AQUA="1;38;5;108"; WIN="1;38;5;223"
     }
     function short(s,n){ return length(s)>n ? substr(s,1,n-1) "…" : s }
@@ -207,6 +257,7 @@ render() {
       st=f[6]
       if (st=="WAITING_PERMISSION") { g="⚠"; gc=ORANGE; ac=ORANGE; lc=FG }
       else if (st=="RUNNING")       { g="▶"; gc=GREEN;  ac=FG;     lc=FG }
+      else if (st=="DONE")          { g="✓"; gc=CYAN;   ac=FG;     lc=FG }
       else if (st=="IDLE")          { g="○"; gc=BLUE;   ac=FG;     lc=GRAY }
       else if (st=="STALE")         { g="◌"; gc=GRAY;   ac=GRAY;   lc=FAINT }
       else                          { g="·";     gc=FAINT;  ac=FAINT;  lc=FAINT }
@@ -249,6 +300,7 @@ preview() {
   case "$status" in
     WAITING_PERMISSION) glyph='⚠'; color='38;5;214'; state='PERMISSION' ;;
     RUNNING)            glyph='▶'; color='38;5;142'; state='RUNNING' ;;
+    DONE)               glyph='✓'; color='38;5;108'; state='DONE' ;;
     IDLE)               glyph='○'; color='38;5;109'; state='IDLE' ;;
     STALE)              glyph='◌'; color='38;5;245'; state='STALE' ;;
     *)                  glyph='·'; color='38;5;240'; state='PANE' ;;
@@ -307,25 +359,40 @@ toggle() {
 ui() {
   has fzf || { echo "tmux-agent-radar needs fzf for the popup UI" >&2; exit 1; }
   mkdir -p "$STATE_DIR"
-  local tmp="$CACHE.$$"
-  [ -s "$CACHE" ] || { scan >"$tmp" && mv "$tmp" "$CACHE"; }
+  local tmp="$CACHE.$$" cache_age=$(( CACHE_TTL + 1 ))
+  # Without the watcher running the cache goes stale silently, so re-scan it
+  # whenever it is older than CACHE_TTL rather than only when it is missing.
+  [ -s "$CACHE" ] && cache_age=$(( $(now_epoch) - $(file_mtime "$CACHE") ))
+  [ "$cache_age" -gt "$CACHE_TTL" ] && { scan >"$tmp" && mv "$tmp" "$CACHE"; }
   local mode="${1:-$(saved_mode)}" next prompt header
   if [ "$mode" = "agents" ]; then
-    next="all"; prompt="agents ❯ "; header="↵ jump   ⌃a all panes   ⌃f close"
+    next="all"; prompt="agents ❯ "
   else
-    mode="all"; next="agents"; prompt="all ❯ "; header="↵ jump   ⌃a agents only   ⌃f close"
+    mode="all"; next="agents"; prompt="all ❯ "
   fi
+  header="↵ jump   ⌃a ${next}   ⌃r refresh   ⌃e label   ⌃n rename   ⌃x kill   ⌃f close"
   save_mode "$mode"
   render "$mode" | fzf --ansi --no-multi --height=100% --layout=reverse --border=none \
     --margin=0 --padding='1,2' --info=inline-right --highlight-line --cycle --scroll-off=3 \
-    --prompt="$prompt" --pointer='❯' --marker='✓ ' --no-scrollbar \
+    --prompt="$prompt" --pointer='❯' --marker='▏' --no-scrollbar \
     --color='bg:-1,bg+:#32302f,gutter:-1,border:#45403d,preview-border:#45403d,label:#7daea3,prompt:#7daea3,pointer:#d8a657,marker:#a9b665,header:#7c6f64,info:#7c6f64,hl:#d8a657,hl+:#d8a657,fg:#d4be98,fg+:#f2e5bc,query:#d4be98,spinner:#7daea3' \
     --delimiter=$'\t' --with-nth='1' \
     --preview="$SCRIPT preview {2}" --preview-window='right,52%,border-left,nowrap,noinfo' \
     --header="$header" \
     --bind="ctrl-f:abort" \
     --bind="enter:become($SCRIPT jump {2})" \
-    --bind="ctrl-a:become($SCRIPT ui $next)"
+    --bind="ctrl-a:become($SCRIPT ui $next)" \
+    --bind="ctrl-r:reload($SCRIPT refresh $mode)" \
+    --bind="ctrl-e:become($SCRIPT label {2})" \
+    --bind="ctrl-n:become($SCRIPT rename-window {2})" \
+    --bind="ctrl-x:become($SCRIPT kill {2})"
+}
+
+refresh() {
+  local tmp="$CACHE.$$"
+  mkdir -p "$STATE_DIR"
+  scan >"$tmp" && mv "$tmp" "$CACHE"
+  render "${1:-all}"
 }
 
 jump() {
@@ -346,7 +413,12 @@ label() {
 rename_window() {
   local pane="$1" current target
   [[ "$pane" == %* ]] || return 0
-  current="$(infer_label "$pane" "$(tmux display-message -p -t "$pane" '#{window_name}')" "$(tmux display-message -p -t "$pane" '#{pane_current_path}')")"
+  load_agents
+  local LABEL=""
+  infer_label "$(pane_opt "$pane" @agent-radar-label)" \
+    "$(tmux display-message -p -t "$pane" '#{window_name}')" \
+    "$(tmux display-message -p -t "$pane" '#{pane_current_path}')"
+  current="$LABEL"
   target="$(tmux display-message -p -t "$pane" '#{session_name}:#{window_index}')"
   tmux command-prompt -I "$current" -p 'Window name' "rename-window -t '$target' '%%'"
 }
@@ -359,7 +431,8 @@ kill_target() {
 
 watch() {
   mkdir -p "$STATE_DIR"
-  local pidfile="$STATE_DIR/watch.pid" seen="$STATE_DIR/notified" interval tmp pane icon agent loc stat age label cwd key msg
+  local pidfile="$STATE_DIR/watch.pid" seen="$STATE_DIR/notified" interval tmp
+  local pane icon agent loc stat age label cwd kind sess_last mtime key msg lines
   interval="$(tmux show -gqv @agent-radar-watch-interval 2>/dev/null || true)"; interval="${interval:-5}"
   if [ -s "$pidfile" ] && kill -0 "$(cat "$pidfile")" 2>/dev/null; then exit 0; fi
   echo $$ >"$pidfile"; trap 'rm -f "$pidfile"' EXIT
@@ -368,8 +441,9 @@ watch() {
     tmp="$CACHE.$$"
     scan >"$tmp" && mv "$tmp" "$CACHE"
     if [ "$(tmux show -gqv @agent-radar-notify 2>/dev/null || true)" = "on" ] || [ "$(tmux show -gqv @agent-radar-notify-macos 2>/dev/null || true)" = "on" ]; then
-      rows prompts | while IFS=$'\t' read -r _ pane icon agent loc stat age label cwd kind; do
-        key="$pane:$(capture_visible "$pane" | cksum | awk '{print $1}')"
+      rows prompts | while IFS=$'\t' read -r _ pane icon agent loc stat age label cwd kind sess_last mtime; do
+        # The tty mtime already identifies this exact screen; no re-capture needed.
+        key="$pane:$mtime"
         grep -qxF "$key" "$seen" && continue
         echo "$key" >>"$seen"
         msg="⚠ $agent needs permission · $loc · $label"
@@ -378,23 +452,32 @@ watch() {
           osascript -e "display notification \"$loc — $label\" with title \"Agent needs permission\"" >/dev/null 2>&1 || true
         fi
       done
+      # Keep the dedup log bounded; it used to grow for the life of the server.
+      lines="$(wc -l <"$seen" 2>/dev/null || echo 0)"
+      if [ "$lines" -gt 800 ]; then
+        tail -n 400 "$seen" >"$seen.tmp" 2>/dev/null && mv "$seen.tmp" "$seen"
+      fi
     fi
     sleep "$interval"
   done
 }
 
 status() {
-  local data total prompts running idle
+  local total prompts running finished idle
   [ -r "$CACHE" ] || exit 0
-  data="$(cat "$CACHE")"
-  total="$(printf '%s\n' "$data" | awk -F '\t' '$10=="agent"{c++} END{print c+0}')"
-  [ "$total" = 0 ] && exit 0
-  prompts="$(printf '%s\n' "$data" | awk -F '\t' '$6=="WAITING_PERMISSION"{c++} END{print c+0}')"
-  running="$(printf '%s\n' "$data" | awk -F '\t' '$6=="RUNNING"{c++} END{print c+0}')"
-  idle="$(printf '%s\n' "$data" | awk -F '\t' '$6=="IDLE"{c++} END{print c+0}')"
+  # One awk pass for every count instead of four.
+  IFS=' ' read -r total prompts running finished idle < <(awk -F '\t' '
+    $10=="agent"{t++}
+    $6=="WAITING_PERMISSION"{p++}
+    $6=="RUNNING"{r++}
+    $6=="DONE"{d++}
+    $6=="IDLE"{i++}
+    END{print t+0, p+0, r+0, d+0, i+0}' "$CACHE")
+  [ "${total:-0}" = 0 ] && exit 0
   printf '🤖%s' "$total"
   [ "$prompts" -gt 0 ] && printf ' ⚠%s' "$prompts"
   [ "$running" -gt 0 ] && printf ' ▶%s' "$running"
+  [ "$finished" -gt 0 ] && printf ' ✓%s' "$finished"
   [ "$idle" -gt 0 ] && printf ' ○%s' "$idle"
   return 0
 }
@@ -405,6 +488,7 @@ case "${1:-ui}" in
   rows|list) rows "${2:-all}" ;;
   view) view "${2:-all}" ;;
   tree|render) render "${2:-all}" ;;
+  refresh) refresh "${2:-all}" ;;
   scan) scan "${2:-all}" ;;
   preview) preview "$2" ;;
   jump) jump "$2" ;;
@@ -413,5 +497,5 @@ case "${1:-ui}" in
   kill) kill_target "$2" ;;
   status) status ;;
   watch) watch ;;
-  *) echo "usage: tmux-agent-radar [ui|toggle CLIENT WIDTH HEIGHT|rows|view|render|scan|preview PANE|jump PANE|label PANE|rename-window PANE|status|watch]" >&2; exit 2 ;;
+  *) echo "usage: tmux-agent-radar [ui|toggle CLIENT WIDTH HEIGHT|rows|view|render|refresh|scan|preview PANE|jump PANE|label PANE|rename-window PANE|status|watch]" >&2; exit 2 ;;
 esac
