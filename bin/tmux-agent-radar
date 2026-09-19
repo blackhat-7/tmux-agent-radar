@@ -148,7 +148,7 @@ scan() {
     fi
     [ "$filter" = "prompts" ] && [ "$stat" != "WAITING_PERMISSION" ] && continue
     [ "$filter" = "agents" ] && [ "$kind" != "agent" ] && continue
-    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$order" "$pane" "$icon" "$agent" "$loc" "$stat" "$age" "$label" "$cwd" "$kind" "$sess_last"
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$order" "$pane" "$icon" "$agent" "$loc" "$stat" "$age" "$label" "$cwd" "$kind" "$sess_last" "$last"
   done <"$panes" | sort -t $'\t' -k11,11nr -k5,5 -k1,1n
   rm -rf "$dir"
 }
@@ -179,71 +179,89 @@ view() {
     }'
 }
 
-tree() {
-  local filter="${1:-all}"
-  rows "$filter" | sort -t $'\t' -k11,11nr -k5,5 -k1,1n | awk -F '\t' '
+render() {
+  local mode="${1:-all}" sorted grouped
+  if [ "$mode" = "agents" ]; then
+    # agents-only: flat list, status first (permission > running > idle > stale),
+    # then most recent window activity.
+    sorted="$(rows agents | sort -t $'\t' -k1,1n -k12,12nr)"
+    grouped=0
+  else
+    sorted="$(rows "$mode" | sort -t $'\t' -k11,11nr -k5,5 -k1,1n)"
+    grouped=1
+  fi
+  [ -n "$sorted" ] || return 0
+  printf '%s\n' "$sorted" | awk -F '\t' -v grouped="$grouped" '
+    BEGIN {
+      FG="38;5;223"; GRAY="38;5;245"; FAINT="38;5;240"
+      GREEN="38;5;142"; ORANGE="38;5;214"; BLUE="38;5;109"
+      AQUA="1;38;5;108"; WIN="1;38;5;223"
+    }
     function short(s,n){ return length(s)>n ? substr(s,1,n-1) "…" : s }
-    function stat(s){
-      if (s=="WAITING_PERMISSION") return "PERMISSION"
-      if (s=="RUNNING") return "RUN"
-      if (s=="STALE") return "OLD"
-      if (s=="IDLE") return "IDLE"
-      if (s=="PANE") return ""
-      return s
+    function c(k,s){ return "\033[" k "m" s "\033[0m" }
+    function locdisp(s,  a,sess,idx){
+      split(s,a,":"); sess=a[1]; idx=a[2]
+      return sess ":" idx " " substr(s,length(sess)+length(idx)+3)
     }
-    function session_label(sess) {
-      if (sess_warn_count[sess])
-        return sprintf("\033[1;36m◆ %-11s\033[0m \033[1;33m⚠%-2s\033[0m", short(sess,11), sess_warn_count[sess])
-      return sprintf("\033[1;36m◆ %-15s\033[0m", short(sess,15))
-    }
-    function pane_text() {
-      label=short(f[8],34); cmd=short(f[4],9); s=stat(f[6])
-      if (f[6]=="WAITING_PERMISSION")
-        return sprintf("\033[1;33m⚠ %-9s\033[0m \033[33mPERM\033[0m \033[2m%-4s\033[0m %s", cmd, f[7], label)
-      if (f[6]=="RUNNING")
-        return sprintf("\033[32m▶ %-9s\033[0m \033[32mRUN \033[0m \033[2m%-4s\033[0m %s", cmd, f[7], label)
-      if (f[10]=="agent")
-        return sprintf("\033[2m%s\033[0m %-9s \033[2m%-4s %-4s\033[0m %s", f[3], cmd, s, f[7], label)
-      return sprintf("\033[2m·\033[0m %-9s \033[2m     %-4s\033[0m %s", cmd, f[7], label)
+    function pane_row(f,withloc,  st,g,gc,ac,lc,out) {
+      st=f[6]
+      if (st=="WAITING_PERMISSION") { g="⚠"; gc=ORANGE; ac=ORANGE; lc=FG }
+      else if (st=="RUNNING")       { g="▶"; gc=GREEN;  ac=FG;     lc=FG }
+      else if (st=="IDLE")          { g="○"; gc=BLUE;   ac=FG;     lc=GRAY }
+      else if (st=="STALE")         { g="◌"; gc=GRAY;   ac=GRAY;   lc=FAINT }
+      else                          { g="·";     gc=FAINT;  ac=FAINT;  lc=FAINT }
+      out = c(gc,g) " " c(ac,sprintf("%-8s",short(f[4],8))) " " c(GRAY,sprintf("%4s",f[7]))
+      if (withloc) out = out "  " c(FAINT,sprintf("%-22s",short(locdisp(f[5]),22)))
+      return out "  " c(lc,short(f[8],40))
     }
     {
-      split($5,a,":"); sess=a[1]; idx=a[2]; win=substr($5,length(sess)+length(idx)+3)
-      key=sess SUBSEP idx SUBSEP win
-      rows[++n]=$0; sessions[n]=sess; wins[n]=key; winlabels[key]=idx ":" win
-      if ($6=="WAITING_PERMISSION") sess_warn_count[sess]++
+      split($5,a,":")
+      lines[++n]=$0
+      if ($6=="WAITING_PERMISSION") warn[a[1]]++
     }
     END {
       for (i=1;i<=n;i++) {
-        split(rows[i],f,"\t"); sess=sessions[i]; key=wins[i]
-        new_sess = (sess != last_session)
-        new_win = new_sess || (key != last_window)
-        left = new_sess ? session_label(sess) : "\033[2m│                \033[0m"
-        win = new_win ? sprintf("\033[2m├─\033[0m \033[1m%-14s\033[0m", short(winlabels[key],14)) : "\033[2m│\033[0m  " sprintf("%-14s", "")
-        printf "%s %s %s\t%s\n", left, win, pane_text(), f[2]
-        if (new_sess) last_session=sess
-        if (new_win) last_window=key
+        split(lines[i],f,"\t")
+        if (!grouped) { printf "%s\t%s\n", pane_row(f,1), f[2]; continue }
+        split(f[5],a,":"); sess=a[1]; idx=a[2]
+        win=substr(f[5],length(sess)+length(idx)+3)
+        key=sess SUBSEP idx SUBSEP win
+        new_sess=(sess!=last_sess); new_win=(new_sess || key!=last_key)
+        if (!new_sess)          left=c(FAINT,"│") sprintf("%-13s","")
+        else if (warn[sess])    left=c(AQUA,sprintf("◆ %-8s",short(sess,8))) " " c(ORANGE,sprintf("⚠%-2s",warn[sess]))
+        else                    left=c(AQUA,sprintf("◆ %-12s",short(sess,12)))
+        if (new_win) mid=c(WIN,sprintf("%-11s",short(idx " " win,11)))
+        else         mid=c(FAINT,"╷") sprintf("%-10s","")
+        printf "%s %s %s\t%s\n", left, mid, pane_row(f,0), f[2]
+        last_sess=sess; last_key=key
       }
     }'
 }
 
 preview() {
-  local pane="$1" icon="${2:-}" agent="${3:-}" loc="${4:-}" status="${5:-}" label="${6:-}" cwd="${7:-}"
-  local lines body
-  [[ "$pane" == %* ]] || { printf '\033[2mSelect a pane row to preview or jump.\033[0m\n'; return 0; }
-  if [ -z "$agent" ] && [ -r "$CACHE" ]; then
-    local row; row="$(awk -F '\t' -v p="$pane" '$2==p {print; exit}' "$CACHE")"
-    local kind
-    IFS=$'\t' read -r _ pane icon agent loc status _ label cwd kind <<<"$row"
-  fi
-  if [ "$status" = "WAITING_PERMISSION" ]; then
-    printf '\033[1;33m⚠ PERMISSION NEEDED\033[0m  \033[2m%s · %s\033[0m\n' "$agent" "$loc"
-  else
-    printf '\033[1;36m%s %s\033[0m  \033[2m%s\033[0m\n' "$icon" "$agent" "$loc"
-  fi
-  printf '\033[1m%s\033[0m\n' "${label:-unlabeled}"
-  printf '\033[2m%s · %s\033[0m\n\n' "$status" "$cwd"
+  local pane="$1" row agent loc status age label cwd rest
+  local glyph color state lines cols body rule
+  [[ "$pane" == %* ]] || { printf '\033[38;5;240mSelect a pane to preview.\033[0m\n'; return 0; }
+  [ -r "$CACHE" ] && row="$(awk -F '\t' -v p="$pane" '$2==p {print; exit}' "$CACHE")"
+  IFS=$'\t' read -r _ _ _ agent loc status age label cwd _ <<<"${row:-}"
+  rest="${loc#*:}"
+  [ "$rest" != "$loc" ] && loc="${loc%%:*}:${rest%%:*} ${rest#*:}"
+  case "$status" in
+    WAITING_PERMISSION) glyph='⚠'; color='38;5;214'; state='PERMISSION' ;;
+    RUNNING)            glyph='▶'; color='38;5;142'; state='RUNNING' ;;
+    IDLE)               glyph='○'; color='38;5;109'; state='IDLE' ;;
+    STALE)              glyph='◌'; color='38;5;245'; state='STALE' ;;
+    *)                  glyph='·'; color='38;5;240'; state='PANE' ;;
+  esac
+  cols="${FZF_PREVIEW_COLUMNS:-60}"
+  rule="$(printf '%*s' "$cols" '' | tr ' ' '─')"
+  printf '\033[%sm%s %s\033[0m  \033[38;5;223m%s\033[0m  \033[38;5;240m%s · %s\033[0m\n' \
+    "$color" "$glyph" "$state" "$agent" "$loc" "$age"
+  printf '\033[1;38;5;223m%s\033[0m\n' "${label:-unlabeled}"
+  printf '\033[38;5;240m%s\033[0m\n' "${cwd/#$HOME/\~}"
+  printf '\033[38;5;240m%s\033[0m\n' "$rule"
   lines="${FZF_PREVIEW_LINES:-38}"
-  body=$(( lines - 6 ))
+  body=$(( lines - 5 ))
   [ "$body" -lt 8 ] && body=8
   capture "$pane" | tail -n "$body"
 }
@@ -293,17 +311,17 @@ ui() {
   [ -s "$CACHE" ] || { scan >"$tmp" && mv "$tmp" "$CACHE"; }
   local mode="${1:-$(saved_mode)}" next prompt header
   if [ "$mode" = "agents" ]; then
-    next="all"; prompt="agents › "; header="↵ jump  ^A show all  ^F/esc close"
+    next="all"; prompt="agents ❯ "; header="↵ jump   ⌃a all panes   ⌃f close"
   else
-    mode="all"; next="agents"; prompt="all › "; header="↵ jump  ^A agents only  ^F/esc close"
+    mode="all"; next="agents"; prompt="all ❯ "; header="↵ jump   ⌃a agents only   ⌃f close"
   fi
   save_mode "$mode"
-  tree "$mode" | fzf --ansi --no-multi --height=100% --layout=reverse --border=none \
-    --margin=0 --padding='1,2' --info=inline-right --highlight-line --cycle \
+  render "$mode" | fzf --ansi --no-multi --height=100% --layout=reverse --border=none \
+    --margin=0 --padding='1,2' --info=inline-right --highlight-line --cycle --scroll-off=3 \
     --prompt="$prompt" --pointer='❯' --marker='✓ ' --no-scrollbar \
-    --color='bg:-1,bg+:#282828,gutter:-1,border:#4f4946,label:#89b482,prompt:#7daea3,pointer:#d8a657,marker:#a9b665,header:#928374,info:#928374,hl:#d8a657,hl+:#f2e5bc,fg:#d4be98,fg+:#f2e5bc' \
+    --color='bg:-1,bg+:#32302f,gutter:-1,border:#45403d,preview-border:#45403d,label:#7daea3,prompt:#7daea3,pointer:#d8a657,marker:#a9b665,header:#7c6f64,info:#7c6f64,hl:#d8a657,hl+:#d8a657,fg:#d4be98,fg+:#f2e5bc,query:#d4be98,spinner:#7daea3' \
     --delimiter=$'\t' --with-nth='1' \
-    --preview="$SCRIPT preview {2}" --preview-window='right,50%,border-rounded,nowrap,noinfo' --preview-label=' preview ' --preview-label-pos=2 \
+    --preview="$SCRIPT preview {2}" --preview-window='right,52%,border-left,nowrap,noinfo' \
     --header="$header" \
     --bind="ctrl-f:abort" \
     --bind="enter:become($SCRIPT jump {2})" \
@@ -386,7 +404,7 @@ case "${1:-ui}" in
   toggle) toggle "${2:-}" "${3:-92%}" "${4:-88%}" ;;
   rows|list) rows "${2:-all}" ;;
   view) view "${2:-all}" ;;
-  tree) tree "${2:-all}" ;;
+  tree|render) render "${2:-all}" ;;
   scan) scan "${2:-all}" ;;
   preview) preview "$2" ;;
   jump) jump "$2" ;;
@@ -395,5 +413,5 @@ case "${1:-ui}" in
   kill) kill_target "$2" ;;
   status) status ;;
   watch) watch ;;
-  *) echo "usage: tmux-agent-radar [ui|toggle CLIENT WIDTH HEIGHT|rows|view|tree|scan|preview PANE|jump PANE|label PANE|rename-window PANE|status|watch]" >&2; exit 2 ;;
+  *) echo "usage: tmux-agent-radar [ui|toggle CLIENT WIDTH HEIGHT|rows|view|render|scan|preview PANE|jump PANE|label PANE|rename-window PANE|status|watch]" >&2; exit 2 ;;
 esac
