@@ -18,4 +18,7 @@ tmux set -g @agent-radar-status "#($RADAR status)"
 
 watch="$(tmux show -gqv @agent-radar-watch)"
 watch="${watch:-on}"
-[ "$watch" != "off" ] && tmux run-shell -b "pkill -f '$RADAR watch' 2>/dev/null || true; '$RADAR' watch"
+# No pkill here: run-shell goes through `sh -c`, so the shell's own command line
+# contains the pattern verbatim and pkill -f would match -- and kill -- that
+# shell before the watcher ever execs. The watcher takes over via its pidfile.
+[ "$watch" != "off" ] && tmux run-shell -b "'$RADAR' watch"

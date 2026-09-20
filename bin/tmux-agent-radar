@@ -432,10 +432,21 @@ kill_target() {
 watch() {
   mkdir -p "$STATE_DIR"
   local pidfile="$STATE_DIR/watch.pid" seen="$STATE_DIR/notified" interval tmp
-  local pane icon agent loc stat age label cwd kind sess_last mtime key msg lines
+  local pane icon agent loc stat age label cwd kind sess_last mtime key msg lines old_watcher
   interval="$(tmux show -gqv @agent-radar-watch-interval 2>/dev/null || true)"; interval="${interval:-5}"
-  if [ -s "$pidfile" ] && kill -0 "$(cat "$pidfile")" 2>/dev/null; then exit 0; fi
-  echo $$ >"$pidfile"; trap 'rm -f "$pidfile"' EXIT
+  # A reload hands over to the new watcher, which may live at a new install
+  # path, so take over from whoever holds the pidfile rather than bailing out.
+  # Wait for the old watcher to die before claiming the file: its own EXIT trap
+  # deletes it, and would otherwise delete our claim a moment after we wrote it.
+  if [ -s "$pidfile" ]; then
+    old_watcher="$(cat "$pidfile")"
+    kill "$old_watcher" 2>/dev/null
+    for _ in {1..20}; do kill -0 "$old_watcher" 2>/dev/null || break; sleep 0.1; done
+  fi
+  echo $$ >"$pidfile"
+  # Only clear the pidfile while it is still ours, so a watcher that outlives
+  # its replacement cannot strand the new one.
+  trap '[ "$(cat "$pidfile" 2>/dev/null)" = "$$" ] && rm -f "$pidfile"' EXIT
   touch "$seen"
   while tmux list-sessions >/dev/null 2>&1; do
     tmp="$CACHE.$$"
